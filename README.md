@@ -1,4 +1,4 @@
-# Automação de Controle de NFs, Recibos e Impostos
+# Automação que elimina o trabalho manual de organizar NFs/recibos/impostos recebidos por e-mail, rodando 100% na nuvem sem custo
 
 Lê e-mails do Gmail com anexos de NF/recibo/imposto, extrai valor, data e número
 via OCR/regex, e organiza automaticamente em uma planilha Excel (`controle.xlsx`),
