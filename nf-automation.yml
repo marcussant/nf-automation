@@ -1,0 +1,38 @@
+name: Automação NF/Recibos/Impostos
+
+on:
+  schedule:
+    - cron: "0 11 * * *"   # todo dia às 08:00 (horário de Brasília, UTC-3)
+  workflow_dispatch:        # permite rodar manualmente pelo botão "Run workflow"
+
+jobs:
+  processar-nfs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar Tesseract (OCR)
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-por
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Rodar automação
+        env:
+          GMAIL_TOKEN_JSON: ${{ secrets.GMAIL_TOKEN_JSON }}
+        run: python main.py
+
+      - name: Commitar planilha atualizada
+        run: |
+          git config user.name "nf-automation-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add controle.xlsx
+          git diff --staged --quiet || git commit -m "Atualiza controle.xlsx [automático]"
+          git push
