@@ -23,6 +23,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 import pdfplumber
+import fitz  # PyMuPDF
 from PIL import Image
 import pytesseract
 
@@ -35,13 +36,25 @@ LABEL_PROCESSADO = "NF-Processado"
 PLANILHA = "controle.xlsx"
 ABA_NF = "NFS_RECIBOS"
 ABA_IMPOSTO = "IMPOSTOS"
+ABA_PARCELA = "PARCELAS"
 
 PALAVRAS_IMPOSTO = ["darf", "imposto", "das", "irpj", "iss", "icms", "inss"]
 
 # regex simples pra achar valor (R$ 1.234,56) e data (dd/mm/aaaa)
 REGEX_VALOR = re.compile(r"R\$\s?([\d\.]+,\d{2})")
 REGEX_DATA = re.compile(r"(\d{2}/\d{2}/\d{4})")
-REGEX_NF = re.compile(r"(?:NF-?e?\s?n?[ºo°]?\s?)(\d{3,9})", re.IGNORECASE)
+# aceita "NF 123", "NF-123", "NF - 123", "NF nº123", "NFe: 123", "NFSE 123", "NFS-e 123" etc.
+# usa [ \t] (não \s) pra nunca atravessar quebra de linha e evitar casar com números de outras seções
+_GAP = r"[ \t]*-?[ \t]*"
+REGEX_NF = re.compile(rf"NF{_GAP}S?{_GAP}E?{_GAP}n?[ºo°]?\.?{_GAP}:?{_GAP}(\d{{1,9}})", re.IGNORECASE)
+# fallback pra quando o documento escreve "Número da Nota Fiscal" por extenso, com o número
+# na linha seguinte (comum em NFS-e de prefeitura) — aqui SIM permite pular 1 quebra de linha,
+# mas só até achar o primeiro número isolado logo em seguida
+REGEX_NUMERO_NF_EXTENSO = re.compile(r"n[uú]mero\s+da\s+nota\s+fiscal[ \t]*\n?[ \t]*(\d{1,9})", re.IGNORECASE)
+
+# cabeçalho típico de aviso de pagamento (ex: TK Elevator) com tabela NF + Valor
+REGEX_CABECALHO_TABELA = re.compile(r"n[ºo°]?\s*\.?\s*da\s*nf", re.IGNORECASE)
+REGEX_LINHA_TABELA = re.compile(r"^\s*(\d{1,9})\s+([\d\.]+,\d{2})\s*$")
 
 
 # ---------- AUTENTICAÇÃO ----------
@@ -113,25 +126,82 @@ def baixar_anexos(service, msg_id):
     return assunto, anexos
 
 
+def ocr_pdf(dados):
+    """OCR página a página, usado quando o PDF não tem texto extraível
+    (ex: documento escaneado / foto salva como PDF)."""
+    texto = ""
+    doc = fitz.open(stream=dados, filetype="pdf")
+    for pagina in doc:
+        pix = pagina.get_pixmap(dpi=200)
+        imagem = Image.open(io.BytesIO(pix.tobytes("png")))
+        texto += pytesseract.image_to_string(imagem, lang="por")
+    return texto
+
+
 def extrair_texto(filename, dados):
     if filename.lower().endswith(".pdf"):
         texto = ""
         with pdfplumber.open(io.BytesIO(dados)) as pdf:
             for pagina in pdf.pages:
                 texto += pagina.extract_text() or ""
-        return texto
+        if texto.strip():
+            return texto
+        print(f"  {filename}: sem texto extraível, tentando OCR...")
+        return ocr_pdf(dados)
     elif filename.lower().endswith((".png", ".jpg", ".jpeg")):
         imagem = Image.open(io.BytesIO(dados))
         return pytesseract.image_to_string(imagem, lang="por")
     return ""
 
 
-def parsear_dados(texto, assunto):
-    valor_match = REGEX_VALOR.search(texto)
+def parsear_aviso_pagamento(texto):
+    """
+    Trata o formato de "aviso de pagamento" que lista várias NFs numa tabela,
+    ex:
+        N° da NF          Valor
+        63                4.975,00
+    Retorna uma lista de dicts (uma entrada por NF encontrada na tabela) ou
+    lista vazia se o texto não tiver esse formato.
+    """
     data_match = REGEX_DATA.search(texto)
-    nf_match = REGEX_NF.search(texto)
+    data = data_match.group(1) if data_match else datetime.today().strftime("%d/%m/%Y")
 
-    valor = valor_match.group(1) if valor_match else "NÃO IDENTIFICADO"
+    linhas = texto.splitlines()
+    resultados = []
+    capturando = False
+
+    for linha in linhas:
+        if REGEX_CABECALHO_TABELA.search(linha):
+            capturando = True
+            continue
+        if not capturando:
+            continue
+
+        m = REGEX_LINHA_TABELA.match(linha)
+        if m:
+            resultados.append({
+                "numero": m.group(1),
+                "valor": m.group(2),
+                "data": data,
+                "tipo": "PARCELA_NF",
+            })
+        elif resultados and linha.strip() and not linha.strip().startswith("-"):
+            # já capturou pelo menos uma linha da tabela e veio algo que não
+            # é mais tabela nem separador -> a tabela acabou
+            break
+
+    return resultados
+
+
+def parsear_dados(texto, assunto):
+    valores = REGEX_VALOR.findall(texto)
+    # em tabelas com várias colunas (descontos, retenções, total), o valor final
+    # listado é, na prática, quase sempre o total/líquido da nota
+    valor = valores[-1] if valores else "NÃO IDENTIFICADO"
+
+    data_match = REGEX_DATA.search(texto)
+    nf_match = REGEX_NF.search(texto) or REGEX_NUMERO_NF_EXTENSO.search(texto)
+
     data = data_match.group(1) if data_match else datetime.today().strftime("%d/%m/%Y")
     numero_nf = nf_match.group(1) if nf_match else "NÃO IDENTIFICADO"
 
@@ -152,6 +222,7 @@ def abrir_planilha():
     for aba, cabecalho in [
         (ABA_NF, ["NF/Recibo", "Valor", "Data", "Assunto do Email", "Data Processamento"]),
         (ABA_IMPOSTO, ["Referência", "Valor", "Data", "Assunto do Email", "Data Processamento"]),
+        (ABA_PARCELA, ["N° da NF", "Valor da Parcela", "Data Pagamento", "Assunto do Email", "Data Processamento"]),
     ]:
         if aba not in wb.sheetnames:
             ws = wb.create_sheet(aba)
@@ -161,7 +232,13 @@ def abrir_planilha():
 
 
 def adicionar_linha(wb, dados, assunto):
-    aba = ABA_IMPOSTO if dados["tipo"] == "IMPOSTO" else ABA_NF
+    if dados["tipo"] == "PARCELA_NF":
+        aba = ABA_PARCELA
+    elif dados["tipo"] == "IMPOSTO":
+        aba = ABA_IMPOSTO
+    else:
+        aba = ABA_NF
+
     ws = wb[aba]
     ws.append([
         dados["numero"],
@@ -196,10 +273,18 @@ def main():
             texto = extrair_texto(filename, dados_bin)
             if not texto:
                 continue
-            dados = parsear_dados(texto, assunto)
-            adicionar_linha(wb, dados, assunto)
-            novos += 1
-            print(f"Processado: {filename} -> {dados}")
+
+            parcelas = parsear_aviso_pagamento(texto)
+            if parcelas:
+                for dados in parcelas:
+                    adicionar_linha(wb, dados, assunto)
+                    novos += 1
+                    print(f"Processado (parcela): {filename} -> {dados}")
+            else:
+                dados = parsear_dados(texto, assunto)
+                adicionar_linha(wb, dados, assunto)
+                novos += 1
+                print(f"Processado: {filename} -> {dados}")
 
         marcar_processado(service, msg_id, label_id)
 
