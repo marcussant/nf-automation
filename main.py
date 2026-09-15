@@ -23,7 +23,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 import pdfplumber
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF
 from PIL import Image
 import pytesseract
 
@@ -38,7 +38,8 @@ ABA_NF = "NFS_RECIBOS"
 ABA_IMPOSTO = "IMPOSTOS"
 ABA_PARCELA = "PARCELAS"
 
-PALAVRAS_IMPOSTO = ["darf", "imposto", "das", "irpj", "iss", "icms", "inss"]
+PALAVRAS_IMPOSTO = ["darf", "gnre", "guia de recolhimento", "documento de arrecadação", "das - simples nacional"]
+MARCADORES_NF = ["nota fiscal", "nfs-e", "nf-e", "recibo"]
 
 # regex simples pra achar valor (R$ 1.234,56) e data (dd/mm/aaaa)
 REGEX_VALOR = re.compile(r"R\$\s?([\d\.]+,\d{2})")
@@ -206,7 +207,12 @@ def parsear_dados(texto, assunto):
     numero_nf = nf_match.group(1) if nf_match else "NÃO IDENTIFICADO"
 
     texto_lower = (texto + assunto).lower()
-    tipo = "IMPOSTO" if any(p in texto_lower for p in PALAVRAS_IMPOSTO) else "NF_RECIBO"
+    if any(m in texto_lower for m in MARCADORES_NF):
+        tipo = "NF_RECIBO"
+    elif any(p in texto_lower for p in PALAVRAS_IMPOSTO):
+        tipo = "IMPOSTO"
+    else:
+        tipo = "NF_RECIBO"
 
     return {"numero": numero_nf, "valor": valor, "data": data, "tipo": tipo}
 
